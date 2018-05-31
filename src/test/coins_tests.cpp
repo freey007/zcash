@@ -152,10 +152,13 @@ public:
                     CNullifiersMap& mapSaplingNullifiers)
     {
         for (CCoinsMap::iterator it = mapCoins.begin(); it != mapCoins.end(); ) {
-            map_[it->first] = it->second.coins;
-            if (it->second.coins.IsPruned() && insecure_rand() % 3 == 0) {
-                // Randomly delete empty entries on write.
-                map_.erase(it->first);
+            if (it->second.flags & CCoinsCacheEntry::DIRTY) {
+                // Same optimization used in CCoinsViewDB is to only write dirty entries.
+                map_[it->first] = it->second.coins;
+                if (it->second.coins.IsPruned() && insecure_rand() % 3 == 0) {
+                    // Randomly delete empty entries on write.
+                    map_.erase(it->first);
+                }
             }
             mapCoins.erase(it++);
         }
@@ -185,10 +188,10 @@ public:
         BatchWriteNullifiers(mapSproutNullifiers, mapSproutNullifiers_);
         BatchWriteNullifiers(mapSaplingNullifiers, mapSaplingNullifiers_);
 
-        mapCoins.clear();
         mapSproutAnchors.clear();
         mapSaplingAnchors.clear();
-        hashBestBlock_ = hashBlock;
+        if (!hashBlock.IsNull())
+            hashBestBlock_ = hashBlock;
         hashBestSproutAnchor_ = hashSproutAnchor;
         hashBestSaplingAnchor_ = hashSaplingAnchor;
         return true;
@@ -875,6 +878,106 @@ BOOST_AUTO_TEST_CASE(coins_coinbase_spends)
         CTransaction tx2(mtx2);
         BOOST_CHECK(!Consensus::CheckTxInputs(tx2, state, cache, 100+COINBASE_MATURITY, Params().GetConsensus()));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-coinbase-spend-has-transparent-outputs");
+    }
+}
+
+// This test is similar to the previous test
+// except the emphasis is on testing the functionality of UpdateCoins
+// random txs are created and UpdateCoins is used to update the cache stack
+BOOST_AUTO_TEST_CASE(updatecoins_simulation_test)
+{
+    // A simple map to track what we expect the cache stack to represent.
+    std::map<uint256, CCoins> result;
+
+    // The cache stack.
+    CCoinsViewTest base; // A CCoinsViewTest at the bottom.
+    std::vector<CCoinsViewCacheTest*> stack; // A stack of CCoinsViewCaches on top.
+    stack.push_back(new CCoinsViewCacheTest(&base)); // Start with one cache.
+
+    // Track the txids we've used and whether they have been spent or not
+    std::map<uint256, CAmount> coinbaseids;
+    std::set<uint256> alltxids;
+
+    for (unsigned int i = 0; i < NUM_SIMULATION_ITERATIONS; i++) {
+        {
+            CMutableTransaction tx;
+            tx.vin.resize(1);
+            tx.vout.resize(1);
+            tx.vout[0].nValue = i; //Keep txs unique
+            unsigned int height = insecure_rand();
+
+            // 1/10 times create a coinbase
+            if (insecure_rand() % 10 == 0 || coinbaseids.size() < 10) {
+                coinbaseids[tx.GetHash()] = tx.vout[0].nValue;
+                assert(CTransaction(tx).IsCoinBase());
+            }
+            // 9/10 times create a regular tx
+            else {
+                uint256 prevouthash;
+                // equally likely to spend coinbase or non coinbase
+                std::set<uint256>::iterator txIt = alltxids.lower_bound(GetRandHash());
+                if (txIt == alltxids.end()) {
+                    txIt = alltxids.begin();
+                }
+                prevouthash = *txIt;
+
+                // Construct the tx to spend the coins of prevouthash
+                tx.vin[0].prevout.hash = prevouthash;
+                tx.vin[0].prevout.n = 0;
+
+                // Update the expected result of prevouthash to know these coins are spent
+                CCoins& oldcoins = result[prevouthash];
+                oldcoins.Clear();
+
+                alltxids.erase(prevouthash);
+                coinbaseids.erase(prevouthash);
+
+                assert(!CTransaction(tx).IsCoinBase());
+            }
+            // Track this tx to possibly spend later
+            alltxids.insert(tx.GetHash());
+
+            // Update the expected result to know about the new output coins
+            CCoins &coins = result[tx.GetHash()];
+            coins.FromTx(tx, height);
+
+            CValidationState dummy;
+            UpdateCoins(tx, *(stack.back()), height);
+        }
+
+        // Once every 1000 iterations and at the end, verify the full cache.
+        if (insecure_rand() % 1000 == 1 || i == NUM_SIMULATION_ITERATIONS - 1) {
+            for (std::map<uint256, CCoins>::iterator it = result.begin(); it != result.end(); it++) {
+                const CCoins* coins = stack.back()->AccessCoins(it->first);
+                if (coins) {
+                    BOOST_CHECK(*coins == it->second);
+                 } else {
+                    BOOST_CHECK(it->second.IsPruned());
+                 }
+            }
+        }
+
+        if (insecure_rand() % 100 == 0) {
+            // Every 100 iterations, change the cache stack.
+            if (stack.size() > 0 && insecure_rand() % 2 == 0) {
+                stack.back()->Flush();
+                delete stack.back();
+                stack.pop_back();
+            }
+            if (stack.size() == 0 || (stack.size() < 4 && insecure_rand() % 2)) {
+                CCoinsView* tip = &base;
+                if (stack.size() > 0) {
+                    tip = stack.back();
+                }
+                stack.push_back(new CCoinsViewCacheTest(tip));
+           }
+        }
+    }
+
+    // Clean up the stack.
+    while (stack.size() > 0) {
+        delete stack.back();
+        stack.pop_back();
     }
 }
 
